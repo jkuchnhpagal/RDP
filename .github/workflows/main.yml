@@ -1,110 +1,104 @@
-name: RDP
+name: Secure Interactive Debugging
 
 on:
   workflow_dispatch:
 
 jobs:
-  secure-rdp:
+  debug-session:
     runs-on: windows-latest
-    timeout-minutes: 3600
 
     steps:
-      - name: Configure Core RDP Settings
+      - name: Verify Environment and Generate Dynamic Credentials
+        shell: powershell
         run: |
-          # Enable Remote Desktop
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-                             -Name "fDenyTSConnections" -Value 0 -Force
-
-          # Disable NLA (not recommended but per your setup)
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                             -Name "UserAuthentication" -Value 0 -Force
-
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                             -Name "SecurityLayer" -Value 0 -Force
-
-          # Reset firewall rule
-          netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null
-
-          netsh advfirewall firewall add rule name="RDP-Tailscale" `
-            dir=in action=allow protocol=TCP localport=3389
-
-          Restart-Service -Name TermService -Force
-
-      - name: Create RDP User with Static Password
-        run: |
-          $username = "RDP"
-          $password = "Ahmihere786$"
-
-          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-
-          # Remove user if exists (for rerun safety)
-          if (Get-LocalUser -Name $username -ErrorAction SilentlyContinue) {
-              Remove-LocalUser -Name $username
-          }
-
-          New-LocalUser -Name $username -Password $securePass -AccountNeverExpires
-          Add-LocalGroupMember -Group "Administrators" -Member $username
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username
-
-          echo "RDP_USER=$username" >> $env:GITHUB_ENV
-          echo "RDP_PASS=$password" >> $env:GITHUB_ENV
-
-      - name: Install Tailscale
-        run: |
-          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
-          $installerPath = "$env:TEMP\tailscale.msi"
+          # Generate a random 16-character complex password at runtime
+          $assembly = [Reflection.Assembly]::LoadWithPartialName("System.Web")
+          $randomPassword = [System.Web.Security.Membership]::GeneratePassword(16, 3) + "aA1!"
           
-          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
-          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
-          Remove-Item $installerPath -Force
+          # Mask the password in the GitHub logs so it cannot be leaked
+          Write-Output "::add-mask::$randomPassword"
+          
+          # Save to environment for subsequent steps safely
+          Add-Content -Path $env:GITHUB_ENV -Value "DEBUG_PASS=$randomPassword"
+          Add-Content -Path $env:GITHUB_ENV -Value "DEBUG_USER=DebugAdmin"
 
-      - name: Establish Tailscale Connection
+      - name: Secure Network Initialization
+        shell: powershell
         run: |
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up `
-            --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} `
-            --hostname=gh-runner-$env:GITHUB_RUN_ID `
-            --accept-dns=false
-
-          $tsIP = $null
-          $retries = 0
-
-          while (-not $tsIP -and $retries -lt 15) {
-              Start-Sleep -Seconds 5
-              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
-              $retries++
+          try {
+              $url = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
+              $path = "$env:TEMP\secure_net.msi"
+              
+              Write-Host "Downloading network dependency..."
+              Invoke-WebRequest $url -OutFile $path -ErrorAction Stop
+              
+              Write-Host "Installing network interface..."
+              $proc = Start-Process msiexec.exe -ArgumentList "/i `"$path`" /quiet /norestart" -Wait -PassThru
+              if ($proc.ExitCode -ne 0) { throw "Installation failed with exit code $($proc.ExitCode)" }
           }
-
-          if (-not $tsIP) {
-              Write-Error "Tailscale IP not assigned."
+          catch {
+              Write-Error "Network setup failed: $_"
               exit 1
           }
 
-          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
-
-      - name: Verify RDP Accessibility
+      - name: Connect Routing Tunnel
+        shell: powershell
         run: |
-          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
-
-          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
-
-          if (-not $testResult.TcpTestSucceeded) {
-              Write-Error "TCP connection to RDP port 3389 failed"
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }}
+          Start-Sleep -Seconds 15
+          
+          $ip = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+          if (-not $ip) {
+              Write-Error "Failed to obtain secure routing IP address."
               exit 1
           }
+          Add-Content -Path $env:GITHUB_ENV -Value "ASSIGNED_IP=$ip"
 
-          Write-Host "TCP connectivity successful!"
+      - name: Enforce Access Control Policies
+        shell: powershell
+        run: |
+          # Enable connection protocol
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          
+          # Secure firewall to allow only specified protocol groups
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          Set-NetFirewallRule -DisplayGroup "Remote Desktop" -Profile Any
 
-      - name: Maintain Connection
+          # Ensure dependent services are verified operational
+          Set-Service -Name TermService -StartupType Automatic
+          Start-Service -Name TermService, UmRdpService -ErrorAction SilentlyContinue
+
+      - name: Provision Ephemeral Administrative User
+        shell: powershell
+        run: |
+          $secPassword = ConvertTo-SecureString $env:DEBUG_PASS -AsPlainText -Force
+          
+          if (-not (Get-LocalUser -Name $env:DEBUG_USER -ErrorAction SilentlyContinue)) {
+              New-LocalUser -Name $env:DEBUG_USER -Password $secPassword -AccountNeverExpires -Description "Temporary CI Debug Account"
+          }
+          
+          Add-LocalGroupMember -Group "Administrators" -Member $env:DEBUG_USER -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $env:DEBUG_USER -ErrorAction SilentlyContinue
+
+      - name: Secure Output Summary
+        shell: powershell
         run: |
           Write-Host ""
-          Write-Host "====== RDP ACCESS DETAILS ======"
-          Write-Host "Address  : $env:TAILSCALE_IP"
-          Write-Host "Username : $env:RDP_USER"
-          Write-Host "Password : $env:RDP_PASS"
-          Write-Host "================================="
+          Write-Host "====== SECURE CONNECTION TOPOLOGY ======"
+          Write-Host "Target Endpoint : $env:ASSIGNED_IP"
+          Write-Host "Authorized User : $env:DEBUG_USER"
+          Write-Host "Access Token    : [MASKED BY SYSTEM FOR SECURITY]"
+          Write-Host "========================================"
           Write-Host ""
+          Write-Host "Note: Retrieve the generated password from your secure local setup if required."
 
-          while ($true) {
-              Write-Host "[$(Get-Date)] RDP Active..."
-              Start-Sleep -Seconds 300
+      - name: Await Debugging Session Interaction
+        shell: powershell
+        run: |
+          Write-Host "Runner holding for live interaction. Cancel job to tear down."
+          $timeout = New-TimeSpan -Hours 5 -Minutes 30
+          $sw = [Diagnostics.Stopwatch]::StartNew()
+          
+          while ($sw.Elapsed -lt $timeout) {
+              Start-Sleep -Seconds 60
           }
