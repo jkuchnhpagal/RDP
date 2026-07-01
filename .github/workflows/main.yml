@@ -8,18 +8,17 @@ jobs:
     runs-on: windows-latest
 
     steps:
-      - name: Verify Environment and Generate Dynamic Credentials
+      - name: Verify Environment and Set Fixed Credentials
         shell: powershell
         run: |
-          # Generate a random 16-character complex password at runtime
-          $assembly = [Reflection.Assembly]::LoadWithPartialName("System.Web")
-          $randomPassword = [System.Web.Security.Membership]::GeneratePassword(16, 3) + "aA1!"
+          # Set a static complex password for the session
+          $staticPassword = "Ahmad786Secure!"
           
-          # Mask the password in the GitHub logs so it cannot be leaked
-          Write-Output "::add-mask::$randomPassword"
+          # Mask the password in the GitHub logs to prevent exposure in plain text
+          Write-Output "::add-mask::$staticPassword"
           
-          # Save to environment for subsequent steps safely
-          Add-Content -Path $env:GITHUB_ENV -Value "DEBUG_PASS=$randomPassword"
+          # Save variables to environment configuration file
+          Add-Content -Path $env:GITHUB_ENV -Value "DEBUG_PASS=$staticPassword"
           Add-Content -Path $env:GITHUB_ENV -Value "DEBUG_USER=DebugAdmin"
 
       - name: Secure Network Initialization
@@ -90,7 +89,7 @@ jobs:
           Write-Host "Access Token    : [MASKED BY SYSTEM FOR SECURITY]"
           Write-Host "========================================"
           Write-Host ""
-          Write-Host "Note: Retrieve the generated password from your secure local setup if required."
+          Write-Host "Note: Connect using the pre-configured fixed password."
 
       - name: Await Debugging Session Interaction
         shell: powershell
